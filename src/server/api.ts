@@ -18,6 +18,7 @@ import { HttpError, getHeader, translateSqliteError, type ApiError } from './htt
 import { readJsonBody, asObject, asString, asInt, asEnum, asDate, optionalMonth, parseYuanToCents, TX_TYPES, CATEGORY_KINDS, ACCOUNT_TYPES } from './body.ts';
 import { currentMonth } from './util.ts';
 import * as q from './db/queries.pg.ts';
+import { get as dbGet } from './db/pg.ts';
 import * as auth from './auth/session.ts';
 import { parseCookies, serializeSessionCookie, serializeClearCookie, SESSION_COOKIE, shouldUseSecureCookie } from './auth/cookies.ts';
 import { requireOwnedAccount, requireOwnedCategory, requireOwnedCategoryWithParent, requireOwnedTransaction } from './auth/guard.ts';
@@ -79,6 +80,8 @@ export const PUBLIC_ROUTES = [
   'POST /api/auth/demo',
   'GET /api/auth/me',
   'POST /api/auth/logout',
+  // 部署平台的健康检查（不带 cookie），必须公开
+  'GET /api/health',
 ] as const;
 
 // ===========================================================================
@@ -249,6 +252,34 @@ route(
 
 /** 当前登录状态。前端启动时用它判断该显示登录页还是主界面 */
 route('GET', '/api/auth/me', ({ user }) => ({ user }), { isPublic: true });
+
+/**
+ * 部署平台用的健康检查接口。
+ *
+ * 为什么需要一个**不要求登录**的健康检查？
+ *   托管平台（Render / Railway / Fly）会定期请求一个地址来判断服务是否正常，
+ *   请求是不带 cookie 的。如果指向需要登录的接口，永远得到 401，
+ *   平台就会认为服务不健康并反复重启 —— 一个很容易踩的坑。
+ *
+ * 返回内容刻意很少：不泄露数据库版本、不返回统计数字。
+ * 它只回答一个问题："这个进程活着吗、能连上数据库吗"。
+ * 这也是为什么它是唯一一个不需要登录的 /api 业务接口。
+ */
+route(
+  'GET',
+  '/api/health',
+  async () => {
+    const started = Date.now();
+    await dbGet('SELECT 1 AS ok');
+    return {
+      ok: true,
+      // 响应时间可以让平台和监控看出数据库是不是在从挂起状态唤醒
+      dbLatencyMs: Date.now() - started,
+      uptimeSeconds: Math.round(process.uptime()),
+    };
+  },
+  { isPublic: true },
+);
 
 route(
   'POST',

@@ -1,0 +1,39 @@
+{
+  "name": "ledger-app",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "记账练手项目：React + Vite 前端，Node 内置 SQLite 后端",
+  "workspaces": [
+    "."
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "db:init": "node --env-file-if-exists=.env src/server/db/schema.ts",
+    "db:migrate": "node --env-file-if-exists=.env src/server/db/schema.ts",
+    "db:seed": "node --env-file-if-exists=.env src/server/db/seed.ts",
+    "db:reset": "npm run db:init -- --reset && npm run db:seed",
+    "test:api": "node --env-file-if-exists=.env scripts/smoke-test.ts",
+    "api": "node --env-file-if-exists=.env src/server/index.ts",
+    "start": "npm run build && npm run api"
+  },
+  "dependencies": {
+    "framer-motion": "^13.4.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.0",
+    "vite": "^8.3.0"
+  }
+}

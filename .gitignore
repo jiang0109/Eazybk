@@ -1,0 +1,38 @@
+# 依赖与构建产物
+node_modules/
+dist/
+.npm-cache/
+
+# 数据库文件（SQLite）
+# ⚠️ 这个目录里是你的真实账目数据，绝对不能进仓库。
+#    别人 clone 之后跑 npm run db:init && npm run db:seed 就能生成自己的。
+#    WAL 模式下的 -wal / -shm 是运行时临时文件，也一起忽略。
+data/
+
+# 环境变量与密钥
+# ⚠️ 这是本文件里最重要的一条。
+#    .env 里会放数据库连接串（含密码）之类的机密。
+#    **一旦提交进 git 历史就洗不掉了** —— 即使之后删掉文件再提交，
+#    历史里的那个提交依然能被 git log -p 翻出来。
+#    所以必须在第一次提交之前就把它挡住（顺序很重要）。
+.env
+.env.local
+.env.*.local
+
+# 证书 / 密钥文件
+*.pem
+*.key
+*.p12
+
+# 编辑器与系统临时文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志与截图（.shots 是我用来做界面验证的临时截图目录）
+*.log
+.shots/
+
+# 测试覆盖率
+coverage/

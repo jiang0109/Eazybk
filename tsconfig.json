@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    /* 服务端代码由 Node 26 直接运行（类型剥离），而 Node 要求相对导入必须写全 .ts 扩展名，
+       所以这里允许带扩展名导入。因为本项目只做类型检查（noEmit），不会有冲突。 */
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* 路径别名：前端组件嵌套较深，用相对路径很容易数错层级（比如 ../../../ 还是 ../../），
+       别名一劳永逸，也让 import 意图更清楚。vite.config.ts 里有一份对应的配置。 */
+    "baseUrl": ".",
+    "paths": {
+      "@shared/*": ["src/shared/*"]
+    }
+  },
+  "include": ["src", "vite.config.ts", "scripts"]
+}

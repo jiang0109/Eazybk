@@ -1,0 +1,140 @@
+@import 'tailwindcss';
+
+/* ===========================================================================
+   设计系统 —— Tailwind v4 用 CSS 配置主题（@theme），没有 tailwind.config.js
+   ===========================================================================
+   深色主题，配色克制：中性灰打底，只用一个主色（琥珀）+ 两个语义色（收入/支出）。
+   克制的原因是记账 App 的信息密度高，颜色一多就吵。
+   =========================================================================== */
+
+@theme {
+  /* --- 背景层次：用三个亮度区分"页面底 / 卡片 / 浮起" --- */
+  --color-base: #0a0b10; /* 页面底色 */
+  --color-surface: #12141c; /* 卡片 */
+  --color-surface-2: #191c26; /* 卡片内嵌区块、输入框 */
+  --color-line: #242835; /* 分割线、边框 */
+
+  /* --- 文字层次 --- */
+  --color-ink: #eef1f7; /* 主要文字 */
+  --color-ink-2: #99a1b3; /* 次要文字 */
+  --color-ink-3: #626b7e; /* 弱化文字、占位符 */
+
+  /* --- 语义色 --- */
+  --color-accent: #f5a524; /* 主色：琥珀 */
+  --color-accent-soft: #3a2c12; /* 主色的浅底（选中态背景） */
+  --color-income: #2dd4a7; /* 收入 */
+  --color-expense: #f4635f; /* 支出 */
+  --color-danger: #ef4444;
+
+  /* --- 字体 --- */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', system-ui, sans-serif;
+  /* 金额用等宽数字字体：让数字对齐，扫一眼就能比较大小 */
+  --font-mono: ui-monospace, 'SF Mono', 'Cascadia Mono', Menlo, Consolas, monospace;
+
+  /* --- 自定义动画 --- */
+  --animate-shimmer: shimmer 1.6s ease-in-out infinite;
+
+  @keyframes shimmer {
+    0%,
+    100% {
+      opacity: 0.35;
+    }
+    50% {
+      opacity: 0.75;
+    }
+  }
+}
+
+/* ===========================================================================
+   基础样式
+   =========================================================================== */
+
+@layer base {
+  html {
+    /* 平滑滚动：就是需求里说的"平滑的滚动动画"最基础的一层 */
+    scroll-behavior: smooth;
+    /* 禁止 iOS 横屏时自动放大字体 */
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    background-color: var(--color-base);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    /* 防止移动端下拉时页面整体回弹（原生 App 手感） */
+    overscroll-behavior-y: none;
+  }
+
+  /* 深色背景下默认的聚焦轮廓太丑，换成主色 */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+  }
+
+  /* 隐藏数字输入框的上下箭头（记账时用不到，还容易误点） */
+  input[type='number']::-webkit-outer-spin-button,
+  input[type='number']::-webkit-inner-spin-button {
+    appearance: none;
+    margin: 0;
+  }
+
+  /* 滚动条做成细的深色，和整体风格统一 */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line);
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+/* ===========================================================================
+   组件层：把重复出现的样式组合收敛成几个类
+   =========================================================================== */
+
+@layer components {
+  /* 卡片：深色背景 + 极细边框（不要用阴影，深色主题里阴影几乎看不见，
+     靠边框的亮度差来区分层次更清晰） */
+  .card {
+    background-color: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: 1rem;
+  }
+
+  /* 安全区适配：iPhone 底部的小黑条 */
+  .pb-safe {
+    padding-bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+  }
+  .pt-safe {
+    padding-top: env(safe-area-inset-top, 0px);
+  }
+
+  /* 加载骨架屏 */
+  .skeleton {
+    background-color: var(--color-surface-2);
+    border-radius: 0.5rem;
+    animation: var(--animate-shimmer);
+  }
+}
+
+/* 尊重系统的"减少动态效果"设置。
+   无障碍要求：如果用户开了这个开关，就不要播放动画。
+   在 @layer 之外写，保证优先级最高。 */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

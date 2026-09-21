@@ -1,5 +1,7 @@
 # 记账 App · Ledger
 
+![CI](https://github.com/jiang0109/Eazybk/actions/workflows/ci.yml/badge.svg)
+
 一个用来**练数据库**的完整小项目：记账 App。
 不是玩具 demo —— 表结构、约束、索引、触发器、事务、认证、多用户隔离
 都按真实项目的做法设计。

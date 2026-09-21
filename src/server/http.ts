@@ -62,41 +62,104 @@ export class HttpError extends Error {
 }
 
 /**
- * 把 SQLite 的英文报错翻译成人能看懂的话。
+ * 把数据库的英文报错翻译成人能看懂的话。
  *
  * 这一步很有价值：数据库约束报错（CHECK / FOREIGN KEY / UNIQUE）是
- * **我们故意设计出来的保护**，不应该以 "SQLITE_CONSTRAINT_CHECK: CHECK
- * constraint failed: transactions" 这种形式丢给用户。
- * 数据库负责拦住错误数据，应用负责把原因说清楚。
+ * **我们故意设计出来的保护**，不应该以 "violates check constraint ..."
+ * 这种形式丢给用户。数据库负责拦住错误数据，应用负责把原因说清楚。
+ *
+ * 迁移提示：PostgreSQL 的错误格式和 SQLite 完全不同。
+ *   SQLite: "CHECK constraint failed: transactions"
+ *   PG    : "new row for relation \"transactions\" violates check constraint \"transactions_check\""
+ * 而且 PG 还有一个**错误码**（err.code）比匹配文本可靠得多：
+ *   23514 check_violation
+ *   23503 foreign_key_violation
+ *   23505 unique_violation
+ *   23502 not_null_violation
+ *   42P01 undefined_table
+ *   42703 undefined_column
+ *   57P03 cannot_connect_now（服务正在启动/挂起中）
+ * 所以下面优先按 code 判断，文本匹配只作为兜底。
  */
 export function translateSqliteError(err: unknown): { status: number; message: string } | null {
   if (!(err instanceof Error)) return null;
   const msg = err.message;
+  const code = (err as { code?: string }).code;
 
-  if (/CHECK constraint failed: transactions/i.test(msg)) {
-    return {
-      status: 400,
-      message: '这笔账的数据不符合规则：收入/支出必须选分类，转账不能有分类，金额不能为 0',
-    };
+  // --- 优先按 PG 的 SQLSTATE 错误码判断（可靠）---
+  if (code === '23514') {
+    // check_violation：具体是哪张表的哪条约束，从 message 里看
+    if (/transactions/i.test(msg)) {
+      return {
+        status: 400,
+        message: '这笔账的数据不符合规则：收入/支出必须选分类，转账不能有分类，金额不能为 0',
+      };
+    }
+    if (/categories/i.test(msg)) {
+      return { status: 400, message: '分类数据不符合规则（类型只能是收入或支出）' };
+    }
+    return { status: 400, message: '数据不符合业务规则，请检查后重试' };
   }
-  if (/CHECK constraint failed: categories/i.test(msg)) {
-    return { status: 400, message: '分类数据不符合规则（类型只能是收入或支出）' };
-  }
-  if (/FOREIGN KEY constraint failed/i.test(msg)) {
+
+  if (code === '23503') {
     return { status: 400, message: '引用了不存在的账户或分类，请刷新后重试' };
   }
-  if (/UNIQUE constraint failed: categories/i.test(msg)) {
-    return { status: 409, message: '已经有同名的分类了' };
+
+  if (code === '23505') {
+    if (/users_username|ux_users_username/i.test(msg)) {
+      return { status: 409, message: '这个用户名已经被注册了' };
+    }
+    if (/categories/i.test(msg)) {
+      return { status: 409, message: '已经有同名的分类了' };
+    }
+    if (/accounts/i.test(msg)) {
+      return { status: 409, message: '已经有同名的账户了' };
+    }
+    return { status: 409, message: '这条数据已经存在了' };
   }
-  if (/UNIQUE constraint failed: accounts/i.test(msg)) {
-    return { status: 409, message: '已经有同名的账户了' };
+
+  if (code === '23502') {
+    return { status: 400, message: '有必填字段没有填写' };
+  }
+
+  // 22007/22008：日期格式或范围错误。PG 的 date 类型会直接拒绝非法日期，
+  // 而 SQLite 要靠 GLOB 约束 —— 这里给出统一的友好提示。
+  if (code === '22007' || code === '22008') {
+    return { status: 400, message: '日期格式不正确或不是真实存在的日期' };
+  }
+
+  if (code === '42P01') {
+    return { status: 500, message: '数据库表不存在，请执行 npm run db:init 初始化' };
+  }
+  if (code === '42703') {
+    return { status: 500, message: '数据库结构与代码不一致，请执行迁移（npm run db:migrate）' };
+  }
+
+  // Neon 的计算在闲置后会挂起，唤醒过程中可能出现连接类错误。
+  // 这类问题通常重试一次就好，所以给一个"稍后重试"的提示而不是通用 500。
+  if (code === '57P03' || /ECONNREFUSED|ETIMEDOUT|Connection terminated|timeout expired/i.test(msg)) {
+    return { status: 503, message: '数据库暂时不可用（可能正在从闲置状态唤醒），请稍后重试' };
+  }
+
+  // --- 兜底：按文本匹配（跨数据库兼容，也应对没有 code 的情况）---
+  if (/violates check constraint/i.test(msg)) {
+    return { status: 400, message: '数据不符合业务规则，请检查后重试' };
+  }
+  if (/foreign key constraint/i.test(msg)) {
+    return { status: 400, message: '引用了不存在的账户或分类，请刷新后重试' };
+  }
+  if (/duplicate key value/i.test(msg)) {
+    return { status: 409, message: '这条数据已经存在了' };
+  }
+  if (/子分类的类型必须和父分类一致/.test(msg)) {
+    return { status: 400, message: '子分类的类型必须和父分类一致' };
   }
   if (/no such (table|column)/i.test(msg)) {
-    // 这种错误说明代码和数据库结构不一致（比如忘了跑 db:init）
-    return { status: 500, message: '数据库结构与代码不一致，请执行 npm run db:reset 重建数据库' };
+    return { status: 500, message: '数据库结构与代码不一致，请执行迁移（npm run db:migrate）' };
   }
   if (/SQLITE_BUSY|database is locked/i.test(msg)) {
     return { status: 503, message: '数据库正忙（可能有并发写入），请稍后重试' };
   }
+
   return null;
 }

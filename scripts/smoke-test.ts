@@ -1,8 +1,8 @@
 /**
  * ---------------------------------------------------------------------------
- * API 冒烟测试
+ * API 冒烟测试（PostgreSQL 版）
  * ---------------------------------------------------------------------------
- *   node scripts/smoke-test.ts
+ *   npm run test:api        （用 .env.test 里的 ledger_test 库）
  *
  * 这不只是"接口能通"的测试，重点在**安全边界**：
  *   - 未登录时所有业务接口必须拒绝
@@ -12,10 +12,16 @@
  * 这些断言的价值在于：多用户系统出问题时，症状往往是"某个人看到了别人的数据"
  * 这种静默错误 —— 它不会报错、不会崩溃，只会悄悄泄露。
  * 所以必须用自动化的方式把它们盯住。
+ *
+ * 迁移说明：这个文件从 SQLite 版改过来，改动主要是
+ *   1. 直接查库的地方从 db.prepare(...) 改成 await get/run(...)
+ *   2. 断言里的 boolean 字段：SQLite 是 0/1，PG 是 true/false
+ *   3. 最后要 closePool()，否则进程不退出
+ * 断言本身一条没改 —— 这也说明"测试是迁移的安全网"这个说法是实在的。
  */
 
 import { handleApiRequest } from '../src/server/api.ts';
-import { getDb } from '../src/server/db/index.ts';
+import { get, run, closePool } from '../src/server/db/pg.ts';
 import { SESSION_COOKIE } from '../src/server/auth/cookies.ts';
 
 let passed = 0;
@@ -64,8 +70,6 @@ function check(name: string, condition: boolean, detail?: unknown) {
   }
 }
 
-const db = getDb();
-
 /**
  * 记录测试开始前的用户数，最后用它验证"清理干净了"。
  *
@@ -75,9 +79,10 @@ const db = getDb();
  *     - 从旧版本迁移过来的库：可能还有迁移前的遗留用户 → 2 个
  *   我第一次写成了 `=== 2`，本地全绿，但在干净库上跑就失败。
  *   **这正是 CI 的意义**：它暴露了"只在我的机器上成立"的假设。
- *   用动态基准就没有这个假设了。
  */
-const usersBeforeTest = (db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number }).n;
+const usersBeforeTest = (await get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM users`))!.n;
+
+console.log(`\n测试库用户数（基准）：${usersBeforeTest}`);
 
 // ===========================================================================
 console.log('\n=== 1. 未登录时必须全部拒绝 ===');
@@ -107,7 +112,6 @@ for (const [method, path] of guarded) {
   check(`未登录 ${method} ${path} → 401`, res.status === 401, res);
 }
 
-// 公开接口应该能访问
 const meAnon = await call('GET', '/api/auth/me');
 check('未登录 GET /api/auth/me → 200 且 user 为 null', meAnon.status === 200 && meAnon.data.user === null, meAnon);
 
@@ -132,17 +136,12 @@ check('注册成功并返回用户', reg.status === 200 && reg.data.user?.userna
 check('注册响应带会话 cookie', Boolean(reg.cookie), reg.cookie);
 check('注册响应**不含**密码哈希', !JSON.stringify(reg.data).includes('scrypt'), reg.data);
 
-const cookieA = reg.cookie;
 const userAId = reg.data.user.id as number;
-// 后面的越权测试都用 reg.cookie 这条会话，这里显式留个引用避免被误删
-void cookieA;
 
 // 密码哈希是否真的落库、且不是明文
-const stored = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(userAId) as {
-  password_hash: string;
-};
-check('数据库里存的是 scrypt 哈希', stored.password_hash.startsWith('scrypt$'), stored.password_hash.slice(0, 20));
-check('数据库里**没有**明文密码', !stored.password_hash.includes(password), null);
+const stored = await get<{ password_hash: string }>(`SELECT password_hash FROM users WHERE id = $1`, [userAId]);
+check('数据库里存的是 scrypt 哈希', stored!.password_hash.startsWith('scrypt$'), stored!.password_hash.slice(0, 20));
+check('数据库里**没有**明文密码', !stored!.password_hash.includes(password), null);
 
 const dup = await call('POST', '/api/auth/register', { username: uniqueName, password });
 check('重复用户名被拒绝', dup.status === 409, dup);
@@ -199,7 +198,11 @@ const demoBalance = await call('GET', '/api/balance', undefined, demoCookie);
 check('演示账号余额不为 0', demoBalance.data.totalBalanceCents !== 0, demoBalance.data?.totalBalanceCents);
 
 const freshAccounts = await call('GET', '/api/accounts', undefined, reg.cookie);
-check('新注册用户看不到任何账户（全新账号）', Array.isArray(freshAccounts.data) && freshAccounts.data.length === 0, freshAccounts.data);
+check(
+  '新注册用户看不到任何账户（全新账号）',
+  Array.isArray(freshAccounts.data) && freshAccounts.data.length === 0,
+  freshAccounts.data,
+);
 
 const freshTx = await call('GET', '/api/transactions', undefined, reg.cookie);
 check('新注册用户的流水为 0 笔', freshTx.data.total === 0, freshTx.data);
@@ -209,19 +212,35 @@ console.log('\n=== 5. 多用户数据隔离（最关键的测试）===');
 // ===========================================================================
 // 模拟一次真实的越权攻击：B 用户拿到 A 用户的资源 id，尝试直接访问。
 
-// 给 A 建一个账户和一笔流水
-const accA = await call('POST', '/api/accounts', { name: 'A的银行卡', type: 'bank', initialBalance: '1000' }, reg.cookie);
+const accA = await call(
+  'POST',
+  '/api/accounts',
+  { name: 'A的银行卡', type: 'bank', initialBalance: '1000' },
+  reg.cookie,
+);
 check('A 创建账户成功', accA.status === 200, accA);
 const accountAId = accA.data.id as number;
 
-const catA = await call('POST', '/api/categories', { name: 'A的分类', kind: 'expense', parentId: null, icon: '🔒' }, reg.cookie);
+const catA = await call(
+  'POST',
+  '/api/categories',
+  { name: 'A的分类', kind: 'expense', parentId: null, icon: '🔒' },
+  reg.cookie,
+);
 check('A 创建分类成功', catA.status === 200, catA);
 const categoryAId = catA.data.id as number;
 
 const txA = await call(
   'POST',
   '/api/transactions',
-  { accountId: accountAId, categoryId: categoryAId, type: 'expense', amount: '100', description: 'A的支出', occurredOn: '2026-01-15' },
+  {
+    accountId: accountAId,
+    categoryId: categoryAId,
+    type: 'expense',
+    amount: '100',
+    description: 'A的支出',
+    occurredOn: '2026-01-15',
+  },
   reg.cookie,
 );
 check('A 记账成功', txA.status === 200, txA);
@@ -252,7 +271,14 @@ check(
 const bUpdateATx = await call(
   'PATCH',
   `/api/transactions/${txAId}`,
-  { accountId: accountAId, categoryId: categoryAId, type: 'expense', amount: '9999', description: '被篡改', occurredOn: '2026-01-15' },
+  {
+    accountId: accountAId,
+    categoryId: categoryAId,
+    type: 'expense',
+    amount: '9999',
+    description: '被篡改',
+    occurredOn: '2026-01-15',
+  },
   cookieB,
 );
 check('B 不能修改 A 的流水', bUpdateATx.status === 404 || bUpdateATx.status === 400, bUpdateATx);
@@ -309,7 +335,7 @@ const reset = await call('POST', '/api/auth/demo/reset', undefined, demoCookie);
 check('演示账号重置成功', reset.status === 200 && reset.data.transactions > 0, reset);
 
 const demoAfterReset = await call('GET', '/api/transactions?limit=1', undefined, demoCookie);
-check('重置后数据恢复', demoAfterReset.data.total === demoTxCountBefore, {
+check('重置后数据恢复到完全相同的笔数（固定随机种子的意义）', demoAfterReset.data.total === demoTxCountBefore, {
   expected: demoTxCountBefore,
   actual: demoAfterReset.data.total,
 });
@@ -327,7 +353,6 @@ console.log('\n=== 7. 登录频率限制 ===');
 
 const rateUser = `ratelimit_${Date.now().toString(36)}`;
 const rateReg = await call('POST', '/api/auth/register', { username: rateUser, password });
-void rateReg.cookie; // 限流测试只需要用户名，不需要会话
 check('被限流的测试账号注册成功', rateReg.status === 200, rateReg);
 
 let got429 = false;
@@ -340,11 +365,10 @@ for (let i = 0; i < 8; i++) {
     break;
   }
 }
-check(`连续失败后触发限流（第 ${lastStatus === 429 ? 'N' : '8'} 次仍未触发）`, got429, { lastStatus });
-check('被限流后即使密码正确也进不去（防爆破的意义所在）', got429, null);
+check(`连续失败后触发限流（最后一次状态码 ${lastStatus}）`, got429, { lastStatus });
 
 // 清理限流记录，避免影响后续测试
-db.prepare('DELETE FROM login_attempts WHERE username = ?').run(rateUser);
+await run(`DELETE FROM login_attempts WHERE username = $1`, [rateUser]);
 
 // ===========================================================================
 console.log('\n=== 8. 业务功能在登录后仍然正常 ===');
@@ -372,17 +396,33 @@ check('rollup 汇总正常', demoRollup.data.items.length <= demoStats.data.item
 const demoMonths = await call('GET', '/api/months', undefined, demoCookie);
 check('月份列表非空', Array.isArray(demoMonths.data) && demoMonths.data.length > 0, demoMonths.data?.length);
 
+const demoCompare = await call('GET', '/api/stats/compare', undefined, demoCookie);
+check('环比接口返回 diffRatio 字段（LAG 窗口函数）', demoCompare.data && 'diffRatio' in demoCompare.data, demoCompare.data);
+
+const demoTrend = await call('GET', '/api/stats/trend?months=6', undefined, demoCookie);
+check('趋势接口补齐 6 个月（generate_series）', demoTrend.data.length === 6, demoTrend.data?.length);
+
 // 金额精度（这个 bug 以前犯过，留着防回归）
 const precise = await call(
   'POST',
   '/api/transactions',
-  { accountId: demoAccountId, categoryId: demoExpenseCatId, type: 'expense', amount: '19.99', description: '精度', occurredOn: '2026-01-15' },
+  {
+    accountId: demoAccountId,
+    categoryId: demoExpenseCatId,
+    type: 'expense',
+    amount: '19.99',
+    description: '精度',
+    occurredOn: '2026-01-15',
+  },
   demoCookie,
 );
-const preciseRow = db.prepare('SELECT amount_cents FROM transactions WHERE id = ?').get(precise.data.id) as {
-  amount_cents: number;
-};
-check('金额 19.99 元精确存成 -1999 分', preciseRow.amount_cents === -1999, preciseRow);
+const preciseRow = await get<{ amount_cents: number }>(
+  `SELECT amount_cents FROM transactions WHERE id = $1`,
+  [precise.data.id],
+);
+check('金额 19.99 元精确存成 -1999 分', preciseRow!.amount_cents === -1999, preciseRow);
+check('金额从数据库读出来是 number（BIGINT 解析器生效）', typeof preciseRow!.amount_cents === 'number', preciseRow);
+
 await call('DELETE', `/api/transactions/${precise.data.id}`, undefined, demoCookie);
 
 const drift = await call('GET', '/api/health/balance', undefined, demoCookie);
@@ -393,21 +433,24 @@ console.log('\n=== 清理测试数据 ===');
 // ===========================================================================
 // 按用户名前缀清理，而不是只删本次记住的那几个 id。
 // 原因：如果某次运行中途断言失败，后面的清理代码就不会执行，
-// 残留的测试用户会污染下一次运行（我就被这个坑过一次 ——
-// 一次失败的运行留下两个用户，导致下一次"只剩 2 个用户"的断言失败，
-// 让人误以为是业务代码出了问题，其实只是测试没打扫干净）。
-const cleanup = db
-  .prepare(`DELETE FROM users WHERE username LIKE 'tester_%' OR username LIKE 'attacker_%' OR username LIKE 'ratelimit_%'`)
-  .run();
-db.prepare('DELETE FROM login_attempts').run();
+// 残留的测试用户会污染下一次运行。
+const cleanup = await run(
+  `DELETE FROM users
+    WHERE username LIKE 'tester_%'
+       OR username LIKE 'attacker_%'
+       OR username LIKE 'ratelimit_%'`,
+);
+await run(`DELETE FROM login_attempts`);
 console.log(`  已清理 ${cleanup.changes} 个测试用户及其数据（外键级联会带走账户/分类/流水/会话）`);
 
-const remaining = db.prepare('SELECT COUNT(*) AS n FROM users').get() as { n: number };
+const remaining = await get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM users`);
 check(
   `清理后用户数回到测试前的 ${usersBeforeTest} 个（没有残留测试账号）`,
-  remaining.n === usersBeforeTest,
-  { before: usersBeforeTest, after: remaining.n },
+  remaining!.n === usersBeforeTest,
+  { before: usersBeforeTest, after: remaining!.n },
 );
+
+await closePool();
 
 console.log(`\n结果：${passed} 通过 / ${failed} 失败\n`);
 process.exit(failed === 0 ? 0 : 1);

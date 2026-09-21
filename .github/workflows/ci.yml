@@ -1,19 +1,31 @@
 # =============================================================================
 #  CI：每次 push / PR 自动验证
 # =============================================================================
-#  跑三件事，对应"这个项目是可信的"三个层面：
-#    1. 类型检查 —— 代码在类型层面是自洽的
-#    2. API 测试 —— 68 项断言，其中一多半是**安全边界的攻击模拟**
-#       （未登录是否被拒、A 用户能否动 B 用户的数据）
+#  跑四件事，对应"这个项目是可信的"四个层面：
+#    1. 建库 + 迁移 —— 表结构和迁移脚本真的能跑通
+#    2. 类型检查 —— 代码在类型层面是自洽的
 #    3. 构建 —— 前端能打包出产物
+#    4. API 测试 —— 70 项断言，其中一多半是**安全边界的攻击模拟**
+#       （未登录是否被拒、A 用户能否动 B 用户的数据）
 #
 #  为什么这个文件对"作品集项目"特别有价值：
 #    它把"我测过了"从一句口头声明变成一条可点击的绿色记录。
 #    面试官不用信任你的描述，直接点进 Actions 就能看到每次提交的验证结果。
 #
-#  关于数据库：本项目用 SQLite，CI 里直接现建一个就行（见 db:init / db:seed），
-#  不需要任何外部服务或密钥 —— 这也是选 SQLite 起步的一个额外好处。
-#  以后迁移到 Postgres 时，这里要加一个 services 容器或者注入连接串的 secret。
+#  ── 关于数据库（迁移到 Postgres 后的关键变化）──────────────────────────
+#  之前用 SQLite 时，CI 里现建一个文件就行，不需要任何外部服务。
+#  换成 Postgres 后，CI 必须有一个 Postgres 可连。
+#
+#  两个选择：
+#    A. 连真实的 Neon（需要在仓库里配 secret 存连接串）
+#    B. 用 GitHub Actions 的 services 起一个**临时 Postgres 容器**  ← 采用这个
+#
+#  为什么选 B：
+#    - 不需要在仓库里存任何密钥（少一个泄露面）
+#    - 不消耗 Neon 的免费额度（每次 CI 都会跑一堆增删改，很费额度）
+#    - 每次都从零开始，测试结果**完全可复现**，不受开发库当前状态影响
+#    - 更快（容器在同一个 runner 里，不走外网）
+#  这也是"生产用托管数据库、测试用一次性数据库"这个通行做法的体现。
 # =============================================================================
 
 name: CI
@@ -22,7 +34,6 @@ on:
   push:
     branches: ['**']
   pull_request:
-  # 允许在 Actions 页面手动触发一次
   workflow_dispatch:
 
 # 同一个分支连续 push 时，取消上一次还在跑的，省额度也更快看到结果
@@ -35,6 +46,32 @@ jobs:
     name: 类型检查 / 测试 / 构建
     runs-on: ubuntu-latest
 
+    # 一次性的 Postgres 容器。测试跑完就销毁，不产生任何持久数据。
+    services:
+      postgres:
+        # 和 Neon 上一致的版本，避免"本地能过、线上语法不支持"
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ledger_test
+        ports:
+          - 5432:5432
+        # 等数据库真正就绪再开始跑步骤，否则第一步就会连接失败
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # 注意这里**没有** sslmode=require —— CI 里的 Postgres 容器不支持 TLS。
+      # src/server/db/pg.ts 里的 needsSsl() 会自动识别本机地址并跳过 SSL。
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ledger_test
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/ledger_test
+      # 测试脚本靠这个开关指定用测试库（见 db/pg.ts 的 getConnectionString）
+      USE_TEST_DB: '1'
+
     steps:
       - name: 检出代码
         uses: actions/checkout@v5
@@ -42,8 +79,8 @@ jobs:
       - name: 安装 Node
         uses: actions/setup-node@v5
         with:
-          # 项目要求 Node >= 22.5（要用内置的 node:sqlite）并且能直接运行 .ts 文件。
-          # 本地开发用的是 26，CI 用 24 验证"兼容下限附近"也能跑。
+          # 项目要求 Node >= 22.5（要用内置的 node:sqlite 时代的遗产：
+          # 直接运行 .ts 文件的能力）。本地开发用的是 26，CI 用 24 验证兼容性。
           node-version: '24'
           cache: npm
 
@@ -52,22 +89,21 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      # SQLite 库是"现建现用"的：CI 每次都是干净环境，
-      # 这一步同时验证了"建表 + 迁移 + 灌数据"这条链路是通的。
+      # 这一步同时验证了"建表 + 迁移 + 灌数据"整条链路是通的。
       # 很多人只在本地跑过一次初始化脚本，上线时才发现脚本早就坏了。
-      - name: 初始化数据库并灌入演示数据
-        run: |
-          npm run db:init
-          npm run db:seed
+      - name: 建表并应用迁移
+        run: npm run db:init
+
+      - name: 灌入演示数据
+        run: npm run db:seed
 
       - name: 类型检查
         run: npm run typecheck
 
-      # 放在构建之后：这部分测试会往演示账号里增删数据（模拟攻击和重置），
-      # 而构建只读前端代码，不受数据库状态影响。
-      # 顺序换过来也不会有问题，但"读操作在前、写操作在后"更好推理。
       - name: 构建前端
         run: npm run build
 
+      # 放在最后：这部分测试会往数据库里增删数据（模拟攻击和重置），
+      # 而前面的步骤只读代码或建结构，不受数据状态影响。
       - name: API 测试（含认证与越权防御）
         run: npm run test:api

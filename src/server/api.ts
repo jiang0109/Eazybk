@@ -8,53 +8,54 @@
  * 因为一旦把计算写进 API 层，就会有人忍不住在接口里用 JS 算月支出、
  * 算分类占比 —— 那时候数据库就退化成文件柜了，"练数据库"也就无从谈起。
  * 所以规矩是：**能算的都让 SQL 算**，API 层只搬运数据。
+ *
+ * 迁移差异：所有 handler 变成 async（PG 是网络数据库）。
+ * 这是本次迁移里波及最广的机械改动 —— 但也是最能体现"封装价值"的地方：
+ * 因为 SQL 都集中在 queries 层，这里只需要加 await，不用改 SQL 逻辑。
  */
 
-import { getDb, tx, type Db, type SqlValue } from './db/index.ts';
 import { HttpError, getHeader, translateSqliteError, type ApiError } from './http.ts';
 import { readJsonBody, asObject, asString, asInt, asEnum, asDate, optionalMonth, parseYuanToCents, TX_TYPES, CATEGORY_KINDS, ACCOUNT_TYPES } from './body.ts';
 import { currentMonth } from './util.ts';
-import * as q from './db/queries.ts';
+import * as q from './db/queries.pg.ts';
 import * as auth from './auth/session.ts';
 import { parseCookies, serializeSessionCookie, serializeClearCookie, SESSION_COOKIE, shouldUseSecureCookie } from './auth/cookies.ts';
-import { requireOwnedAccount, requireOwnedCategory, requireOwnedTransaction } from './auth/guard.ts';
+import { requireOwnedAccount, requireOwnedCategory, requireOwnedCategoryWithParent, requireOwnedTransaction } from './auth/guard.ts';
 import type { AuthUser } from './auth/session.ts';
 import type { Category, TxType } from '../shared/types.ts';
 
 type Method = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 interface Ctx {
-  db: Db;
   /**
    * 当前登录用户。**只有公开路由**（登录/注册/一键体验）允许它是 null，
-   * 其余路由在分发阶段就已经拦掉了未登录请求，所以业务路由里可以放心非空断言。
+   * 其余路由在分发阶段就已经拦掉了未登录请求。
    */
   user: AuthUser | null;
-  /** URL 路径参数，比如 /api/transactions/:id 里的 id（仍是字符串，需要自己转数字） */
+  /** URL 路径参数，比如 /api/transactions/:id 里的 id（仍是字符串） */
   params: Record<string, string>;
   query: URLSearchParams;
   body: unknown;
-  /** 原始请求，cookie 等场景需要（登录要读，登录成功要写） */
+  /** 原始请求：cookie 等场景需要 */
   req: Request;
 }
 
 interface Route {
   method: Method;
-  /** 路径段数组，':id' 表示参数位 */
   segments: string[];
   /** 是否允许未登录访问。默认 false —— 新增路由默认就是受保护的 */
   isPublic?: boolean;
-  handler: (ctx: Ctx) => unknown;
+  handler: (ctx: Ctx) => Promise<unknown> | unknown;
 }
 
 const routes: Route[] = [];
-function route(method: Method, path: string, handler: (ctx: Ctx) => unknown, opts: { isPublic?: boolean } = {}) {
-  routes.push({
-    method,
-    segments: path.split('/').filter(Boolean),
-    isPublic: opts.isPublic ?? false,
-    handler,
-  });
+function route(
+  method: Method,
+  path: string,
+  handler: (ctx: Ctx) => Promise<unknown> | unknown,
+  opts: { isPublic?: boolean } = {},
+) {
+  routes.push({ method, segments: path.split('/').filter(Boolean), isPublic: opts.isPublic ?? false, handler });
 }
 
 /**
@@ -103,7 +104,11 @@ function signedAmount(type: TxType, cents: number): number {
  * 分工是：数据库约束负责**最后一道防线**（谁也绕不过去），
  * 应用层负责**能给出好提示的第一道防线**。
  */
-function normalizeCategory(db: Db, userId: number, type: TxType, categoryId: number | null): number | null {
+async function normalizeCategory(
+  userId: number,
+  type: TxType,
+  categoryId: number | null,
+): Promise<number | null> {
   if (type === 'transfer') {
     // 转账没有"花在哪儿"的概念。这里选择**明确拒绝**而不是静默丢掉分类：
     // 用户传了分类，说明请求本身自相矛盾，悄悄忽略会掩盖调用方的 bug。
@@ -113,9 +118,9 @@ function normalizeCategory(db: Db, userId: number, type: TxType, categoryId: num
 
   if (categoryId === null) throw new HttpError(400, '请选择一个分类');
 
-  // 注意这里用的是 requireOwnedCategory：它把 user_id 写进了 WHERE 条件，
+  // 注意用的是 requireOwnedCategory：它把 user_id 写进了 WHERE 条件，
   // 所以"别人的分类"会直接表现为"不存在"，而不是先查出来再判断。
-  const row = requireOwnedCategory(db, userId, categoryId);
+  const row = await requireOwnedCategory(userId, categoryId);
 
   if (row.kind !== type) {
     const label = (k: string) => (k === 'income' ? '收入' : '支出');
@@ -128,7 +133,7 @@ function normalizeCategory(db: Db, userId: number, type: TxType, categoryId: num
  * 统一解析流水表单。
  * 新增和修改共用一套校验逻辑 —— 否则两边规则容易写得不一致（改的时候少校验一项）。
  */
-function parseTransactionInput(db: Db, userId: number, body: unknown) {
+async function parseTransactionInput(userId: number, body: unknown) {
   const o = asObject(body);
 
   const type = asEnum(o.type, '类型', TX_TYPES);
@@ -136,18 +141,17 @@ function parseTransactionInput(db: Db, userId: number, body: unknown) {
   const accountId = asInt(o.accountId, '账户', { min: 1 });
 
   // 账户必须属于当前用户（IDOR 防御）
-  requireOwnedAccount(db, userId, accountId);
+  await requireOwnedAccount(userId, accountId);
 
-  const categoryId = o.categoryId === null || o.categoryId === undefined
-    ? null
-    : asInt(o.categoryId, '分类', { min: 1 });
+  const categoryId =
+    o.categoryId === null || o.categoryId === undefined ? null : asInt(o.categoryId, '分类', { min: 1 });
 
   return {
     type,
     amountCents: signedAmount(type, amountCents),
     accountId,
     // 转账时 normalizeCategory 会强制返回 null 并拒绝带分类的请求
-    categoryId: normalizeCategory(db, userId, type, categoryId),
+    categoryId: await normalizeCategory(userId, type, categoryId),
     description: asString(o.description, '备注', { required: false, max: 200 }),
     occurredOn: asDate(o.occurredOn, '日期'),
   };
@@ -160,9 +164,9 @@ function parseTransactionInput(db: Db, userId: number, body: unknown) {
 //  这里只负责"解析表单 → 调用 → 设置/清除 cookie"。
 
 /** 登录成功后统一套上会话 cookie */
-function withSessionCookie(db: Db, user: AuthUser, req: Request): Response {
-  const token = auth.createSession(db, user.id);
-  const secure = shouldUseSecureCookie() || new URL(req.url, 'http://localhost').protocol === 'https:';
+async function withSessionCookie(user: AuthUser, req: Request): Promise<Response> {
+  const token = await auth.createSession(user.id);
+  const secure = shouldUseSecureCookie(req);
 
   return new Response(JSON.stringify({ user }), {
     status: 200,
@@ -176,10 +180,10 @@ function withSessionCookie(db: Db, user: AuthUser, req: Request): Response {
 route(
   'POST',
   '/api/auth/register',
-  ({ db, body, req }) => {
+  async ({ body, req }) => {
     const o = asObject(body);
     // 用户名规则：3-20 位，只允许字母数字下划线。
-    // 限制字符集不只是好看 —— 它还顺便避免了各种同形字/空白字符混淆登录名的问题。
+    // 限制字符集不只为了好看 —— 还顺便避免了各种同形字/空白字符混淆登录名的问题。
     const username = asString(o.username, '用户名', { max: 20 });
     if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) {
       throw new HttpError(400, '用户名需要 3-20 位，只能包含字母、数字和下划线');
@@ -190,7 +194,7 @@ route(
 
     const name = o.name === undefined || o.name === '' ? username : asString(o.name, '昵称', { max: 20 });
 
-    const result = auth.register(db, { name, username, password });
+    const result = await auth.register({ name, username, password });
     if (!result.ok) {
       if (result.reason === 'username_taken_by_demo') {
         throw new HttpError(409, '这个用户名是保留的，请换一个');
@@ -199,7 +203,7 @@ route(
     }
 
     // 注册后直接给会话，省掉"注册完再登录一次"的步骤
-    return withSessionCookie(db, result.user, req);
+    return withSessionCookie(result.user, req);
   },
   { isPublic: true },
 );
@@ -207,12 +211,12 @@ route(
 route(
   'POST',
   '/api/auth/login',
-  ({ db, body, req }) => {
+  async ({ body, req }) => {
     const o = asObject(body);
     const username = asString(o.username, '用户名', { max: 20 });
     const password = asString(o.password, '密码', { max: 72 });
 
-    const result = auth.login(db, username, password);
+    const result = await auth.login(username, password);
 
     if (!result.ok) {
       if (result.reason === 'rate_limited') {
@@ -226,7 +230,7 @@ route(
       throw new HttpError(401, '用户名或密码不正确');
     }
 
-    return withSessionCookie(db, result.user, req);
+    return withSessionCookie(result.user, req);
   },
   { isPublic: true },
 );
@@ -235,29 +239,24 @@ route(
 route(
   'POST',
   '/api/auth/demo',
-  ({ db, req }) => {
-    const demo = auth.getDemoUser(db);
+  async ({ req }) => {
+    const demo = await auth.getDemoUser();
     if (!demo) throw new HttpError(503, '演示账号还没有初始化，请先执行 npm run db:seed');
-    return withSessionCookie(db, demo, req);
+    return withSessionCookie(demo, req);
   },
   { isPublic: true },
 );
 
 /** 当前登录状态。前端启动时用它判断该显示登录页还是主界面 */
-route(
-  'GET',
-  '/api/auth/me',
-  ({ user }) => ({ user }),
-  { isPublic: true },
-);
+route('GET', '/api/auth/me', ({ user }) => ({ user }), { isPublic: true });
 
 route(
   'POST',
   '/api/auth/logout',
-  ({ db, req }) => {
+  async ({ req }) => {
     const token = parseCookies(getHeader(req, 'cookie'))[SESSION_COOKIE];
-    auth.destroySession(db, token);
-    const secure = shouldUseSecureCookie() || new URL(req.url, 'http://localhost').protocol === 'https:';
+    await auth.destroySession(token);
+    const secure = shouldUseSecureCookie(req);
 
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
@@ -273,19 +272,19 @@ route(
 /**
  * 重置演示数据。
  *
- * 为什么需要它：演示账号是可以随便增删改的（不然访客体验不到功能），
+ * 为什么需要它：演示账号可以随便增删改（不然访客体验不到功能），
  * 但被玩坏之后下一个访客打开就是空界面。这个接口把演示数据恢复原样。
  *
  * 两个安全限制：
- *   1. 只有演示账号能调用（拿自己的真实账号来重置别人的数据是绝对不行的）
- *   2. 重置是在一个事务里做的 —— 中途失败不会留下"删了一半"的残缺数据
+ *   1. 只有演示账号能调用（拿自己的真实账号去重置别人的数据是绝对不行的）
+ *   2. 重置在一个事务里完成 —— 中途失败不会留下"删了一半"的残缺数据
  */
-route('POST', '/api/auth/demo/reset', async ({ db, user }) => {
+route('POST', '/api/auth/demo/reset', async ({ user }) => {
   const me = currentUser(user);
   if (!me.isDemo) throw new HttpError(403, '只有演示账号可以重置演示数据');
 
-  const { resetUserData } = await import('./db/seed.ts');
-  const result = resetUserData(db, me.id);
+  const { resetUserData } = await import('./db/seed.pg.ts');
+  const result = await resetUserData(me.id);
   return { ok: true, ...result };
 });
 
@@ -293,16 +292,17 @@ route('POST', '/api/auth/demo/reset', async ({ db, user }) => {
 //  账户
 // ===========================================================================
 
-route('GET', '/api/accounts', ({ db, user }) => q.listAccounts(db, currentUser(user).id));
+route('GET', '/api/accounts', async ({ user }) => q.listAccounts(currentUser(user).id));
 
-route('POST', '/api/accounts', ({ db, user, body }) => {
+route('POST', '/api/accounts', async ({ user, body }) => {
   const me = currentUser(user);
   const o = asObject(body);
-  const initialBalanceCents = o.initialBalance === undefined || o.initialBalance === ''
-    ? 0
-    : parseYuanToCents(o.initialBalance, '初始余额') * (o.initialBalanceNegative === true ? -1 : 1);
+  const initialBalanceCents =
+    o.initialBalance === undefined || o.initialBalance === ''
+      ? 0
+      : parseYuanToCents(o.initialBalance, '初始余额') * (o.initialBalanceNegative === true ? -1 : 1);
 
-  return q.createAccount(db, {
+  return q.createAccount({
     name: asString(o.name, '账户名', { max: 30 }),
     type: asEnum(o.type, '账户类型', ACCOUNT_TYPES),
     initialBalanceCents,
@@ -319,8 +319,8 @@ interface CategoryNode extends Category {
   children: Category[];
 }
 
-route('GET', '/api/categories', ({ db, user }) => {
-  const all = q.listCategories(db, currentUser(user).id);
+route('GET', '/api/categories', async ({ user }) => {
+  const all = await q.listCategories(currentUser(user).id);
   const roots = all.filter((c) => c.parentId === null);
   const nodes: CategoryNode[] = roots.map((r) => ({
     ...r,
@@ -329,26 +329,23 @@ route('GET', '/api/categories', ({ db, user }) => {
   return nodes;
 });
 
-route('POST', '/api/categories', ({ db, user, body }) => {
+route('POST', '/api/categories', async ({ user, body }) => {
   const me = currentUser(user);
   const o = asObject(body);
   const kind = asEnum(o.kind, '分类类型', CATEGORY_KINDS);
-  const parentId = o.parentId === null || o.parentId === undefined ? null : asInt(o.parentId, '父分类', { min: 1 });
+  const parentId =
+    o.parentId === null || o.parentId === undefined ? null : asInt(o.parentId, '父分类', { min: 1 });
 
   if (parentId !== null) {
     // 二级分类必须和父分类同类型（数据库触发器也会挡，这里给出更好的提示）。
-    // requireOwnedCategory 同时保证了父分类属于当前用户 ——
+    // requireOwnedCategoryWithParent 同时保证了父分类属于当前用户 ——
     // 否则就能把分类挂到别人的分类下面，制造出越权数据。
-    const parent = requireOwnedCategory(db, me.id, parentId);
+    const parent = await requireOwnedCategoryWithParent(me.id, parentId);
     if (parent.kind !== kind) throw new HttpError(400, '子分类的类型必须和父分类一致');
-
-    const parentRow = db.prepare('SELECT parent_id FROM categories WHERE id = ?').get(parentId) as {
-      parent_id: number | null;
-    };
-    if (parentRow.parent_id !== null) throw new HttpError(400, '最多支持两级分类');
+    if (parent.parentId !== null) throw new HttpError(400, '最多支持两级分类');
   }
 
-  const id = q.createCategory(db, {
+  const id = await q.createCategory({
     name: asString(o.name, '分类名', { max: 20 }),
     kind,
     parentId,
@@ -358,24 +355,24 @@ route('POST', '/api/categories', ({ db, user, body }) => {
   return { id };
 });
 
-route('PATCH', '/api/categories/:id', ({ db, user, params, body }) => {
+route('PATCH', '/api/categories/:id', async ({ user, params, body }) => {
   const me = currentUser(user);
   const id = asInt(params.id, '分类 id', { min: 1 });
   // 先确认这个分类是我的，再改（否则能改别人的分类名）
-  requireOwnedCategory(db, me.id, id);
+  await requireOwnedCategory(me.id, id);
 
   const o = asObject(body);
   const icon = o.icon === undefined || o.icon === null ? null : asString(o.icon, '图标', { required: false, max: 4 });
-  q.renameCategory(db, id, asString(o.name, '分类名', { max: 20 }), icon);
+  await q.renameCategory(id, asString(o.name, '分类名', { max: 20 }), icon);
   return { ok: true };
 });
 
-route('DELETE', '/api/categories/:id', ({ db, user, params }) => {
+route('DELETE', '/api/categories/:id', async ({ user, params }) => {
   const me = currentUser(user);
   const id = asInt(params.id, '分类 id', { min: 1 });
-  requireOwnedCategory(db, me.id, id);
+  await requireOwnedCategory(me.id, id);
 
-  const result = q.deleteCategory(db, id);
+  const result = await q.deleteCategory(id);
   if (!result.ok) throw new HttpError(409, result.reason ?? '删除失败');
   return { ok: true };
 });
@@ -384,7 +381,7 @@ route('DELETE', '/api/categories/:id', ({ db, user, params }) => {
 //  流水
 // ===========================================================================
 
-route('GET', '/api/transactions', ({ db, user, query }) => {
+route('GET', '/api/transactions', async ({ user, query }) => {
   const me = currentUser(user);
   const filter: q.TxFilter = {
     month: optionalMonth(query.get('month')),
@@ -396,54 +393,52 @@ route('GET', '/api/transactions', ({ db, user, query }) => {
     offset: query.get('offset') ? asInt(query.get('offset'), 'offset', { min: 0 }) : 0,
   };
 
-  // 列表和总数一起返回：前端要显示"共 N 笔"，也用它判断是否还有下一页。
-  // 注意两个查询都传了 me.id —— 查询层内部会把 user_id 写进 WHERE，
-  // 所以上层不需要（也无法）读到别的用户的数据。
-  return {
-    items: q.listTransactions(db, filter, me.id),
-    total: q.countTransactions(db, filter, me.id),
-  };
+  // 两个查询并发跑：它们互不依赖，串行等待没有意义。
+  // 在本地文件数据库上这点差异看不出来，但经过网络访问托管数据库时，
+  // "并行两次往返"比"串行两次往返"能省掉一半延迟。
+  const [items, total] = await Promise.all([
+    q.listTransactions(filter, me.id),
+    q.countTransactions(filter, me.id),
+  ]);
+
+  return { items, total };
 });
 
-route('POST', '/api/transactions', ({ db, user, body }) => {
+route('POST', '/api/transactions', async ({ user, body }) => {
   const me = currentUser(user);
-  const input = parseTransactionInput(db, me.id, body);
-  const id = q.createTransaction(db, input, me.id);
+  const input = await parseTransactionInput(me.id, body);
+  const id = await q.createTransaction(input, me.id);
   return { id };
 });
 
-route('PATCH', '/api/transactions/:id', ({ db, user, params, body }) => {
+route('PATCH', '/api/transactions/:id', async ({ user, params, body }) => {
   const me = currentUser(user);
   const id = asInt(params.id, '流水 id', { min: 1 });
   // 关键：先确认这笔流水属于我。少了这一步，攻击者就能改别人的账，
   // 而且因为是"改"而不是"插入"，触发器会连别人账户的余额一起改错。
-  requireOwnedTransaction(db, me.id, id);
+  await requireOwnedTransaction(me.id, id);
 
-  const input = parseTransactionInput(db, me.id, body);
-  q.updateTransaction(db, id, input);
+  const input = await parseTransactionInput(me.id, body);
+  await q.updateTransaction(id, input);
   return { ok: true };
 });
 
-route('DELETE', '/api/transactions/:id', ({ db, user, params }) => {
+route('DELETE', '/api/transactions/:id', async ({ user, params }) => {
   const me = currentUser(user);
   const id = asInt(params.id, '流水 id', { min: 1 });
-  requireOwnedTransaction(db, me.id, id);
-
-  // 删除是写操作，而且触发器要改余额，所以放进事务里保证原子性
-  return tx(db, () => {
-    q.deleteTransaction(db, id);
-    return { ok: true };
-  });
+  await requireOwnedTransaction(me.id, id);
+  await q.deleteTransaction(id);
+  return { ok: true };
 });
 
 // ===========================================================================
 //  统计
 // ===========================================================================
 
-route('GET', '/api/months', ({ db, user }) => q.listAvailableMonths(db, currentUser(user).id));
+route('GET', '/api/months', async ({ user }) => q.listAvailableMonths(currentUser(user).id));
 
-route('GET', '/api/balance', ({ db, user }) => {
-  const overview = q.getBalanceOverview(db, currentUser(user).id);
+route('GET', '/api/balance', async ({ user }) => {
+  const overview = await q.getBalanceOverview(currentUser(user).id);
   // 顺便给出"元"版本，前端就不用重复做除法（但图表仍然用分，避免浮点误差）
   return {
     ...overview,
@@ -454,18 +449,19 @@ route('GET', '/api/balance', ({ db, user }) => {
   };
 });
 
-route('GET', '/api/summary', ({ db, user, query }) => {
+route('GET', '/api/summary', async ({ user, query }) => {
   const month = optionalMonth(query.get('month')) ?? currentMonth();
-  return q.getMonthlySummary(db, { month, userId: currentUser(user).id });
+  return q.getMonthlySummary({ month, userId: currentUser(user).id });
 });
 
-route('GET', '/api/stats/categories', ({ db, user, query }) => {
+route('GET', '/api/stats/categories', async ({ user, query }) => {
+  const me = currentUser(user);
   const month = optionalMonth(query.get('month')) ?? currentMonth();
   const kind = query.get('kind') ? asEnum(query.get('kind'), '类型', CATEGORY_KINDS) : 'expense';
   // rollup=1 时把子分类汇总到父分类（饼图看大项更清楚，列表可以看明细）
   const rollup = query.get('rollup') === '1';
 
-  const stats = q.getCategoryStats(db, { month, kind, rollup, userId: currentUser(user).id });
+  const stats = await q.getCategoryStats({ month, kind, rollup, userId: me.id });
   const totalCents = stats.reduce((s, x) => s + x.totalCents, 0);
   const txCount = stats.reduce((s, x) => s + x.txCount, 0);
 
@@ -482,24 +478,24 @@ route('GET', '/api/stats/categories', ({ db, user, query }) => {
 });
 
 /** 和上个月对比（用 LAG 窗口函数一次算出两个月的值） */
-route('GET', '/api/stats/compare', ({ db, user, query }) => {
+route('GET', '/api/stats/compare', async ({ user, query }) => {
   const month = optionalMonth(query.get('month')) ?? currentMonth();
-  return q.getMonthComparison(db, { month, userId: currentUser(user).id });
+  return q.getMonthComparison({ month, userId: currentUser(user).id });
 });
 
-route('GET', '/api/stats/trend', ({ db, user, query }) => {
+route('GET', '/api/stats/trend', async ({ user, query }) => {
   const months = query.get('months') ? asInt(query.get('months'), 'months', { min: 1, max: 24 }) : 6;
-  return q.getTrend(db, { months, userId: currentUser(user).id });
+  return q.getTrend({ months, userId: currentUser(user).id });
 });
 
 /** 对账检查：返回空数组表示余额没有漂移（只检查自己的账户） */
-route('GET', '/api/health/balance', ({ db, user }) => {
-  const drift = q.checkBalanceDrift(db, currentUser(user).id);
+route('GET', '/api/health/balance', async ({ user }) => {
+  const drift = await q.checkBalanceDrift(currentUser(user).id);
   return { ok: drift.length === 0, drift };
 });
 
 /** 建一笔转账：两行相反数，必须在一个事务里 */
-route('POST', '/api/transfers', ({ db, user, body }) => {
+route('POST', '/api/transfers', async ({ user, body }) => {
   const me = currentUser(user);
   const o = asObject(body);
   const fromAccountId = asInt(o.fromAccountId, '转出账户', { min: 1 });
@@ -512,44 +508,37 @@ route('POST', '/api/transfers', ({ db, user, body }) => {
 
   // 两个账户都必须是我的。少了这个检查，就能把钱"转"到别人的账户
   // （或者从别人的账户转出来 —— 那等于直接偷钱）。
-  const fromName = requireOwnedAccount(db, me.id, fromAccountId).name;
-  const toName = requireOwnedAccount(db, me.id, toAccountId).name;
+  const from = await requireOwnedAccount(me.id, fromAccountId);
+  const to = await requireOwnedAccount(me.id, toAccountId);
 
-  return tx(db, () => {
-    q.createTransaction(
-      db,
-      {
-        accountId: fromAccountId,
-        categoryId: null,
-        type: 'transfer',
-        amountCents: -amountCents,
-        description: description || `转到${toName}`,
-        occurredOn,
-      },
-      me.id,
-    );
-    q.createTransaction(
-      db,
-      {
-        accountId: toAccountId,
-        categoryId: null,
-        type: 'transfer',
-        amountCents,
-        description: description || `来自${fromName}`,
-        occurredOn,
-      },
-      me.id,
-    );
+  // ⚠️ 事务里必须用同一个连接。PG 是网络数据库，连接池每次 query
+  //    可能给不同连接，而事务绑定在单个连接上 —— 用池跑两次会变成
+  //    两个独立事务，起不到原子性作用。tx() 封装已经处理了这一点。
+  const { tx } = await import('./db/pg.ts');
+  await tx(async (client) => {
+    const insertTx = (accountId: number, cents: number, desc: string) =>
+      client.query(
+        `INSERT INTO transactions (user_id, account_id, category_id, type, amount_cents, description, occurred_on)
+         VALUES ($1, $2, NULL, 'transfer', $3, $4, $5::date)`,
+        [me.id, accountId, cents, desc, occurredOn],
+      );
 
-    return { ok: true, amountCents };
+    // 一次转账产生"两行相反数"，必须一起成功
+    await insertTx(fromAccountId, -amountCents, description || `转到${to.name}`);
+    await insertTx(toAccountId, amountCents, description || `来自${from.name}`);
   });
+
+  return { ok: true, amountCents };
 });
 
 // ===========================================================================
 //  路由分发
 // ===========================================================================
 
-function matchRoute(method: string, pathname: string): { route: Route; params: Record<string, string> } | null {
+function matchRoute(
+  method: string,
+  pathname: string,
+): { route: Route; params: Record<string, string> } | null {
   const parts = pathname.split('/').filter(Boolean);
 
   for (const r of routes) {
@@ -575,12 +564,11 @@ function matchRoute(method: string, pathname: string): { route: Route; params: R
  * 处理一个 API 请求。
  *
  * 这个函数被两种运行方式共用：
- *   - 开发：被 Vite 的中间件直接调用（见 server/vite-plugin.ts），所以不需要跨域
- *   - 生产：被 node:http 服务器调用（见 server/index.ts）
- * 同一个 handler 两种跑法，避免了"开发环境正常、上线就挂"的经典问题。
+ *   - 开发：被 Vite 的中间件直接调用（见 vite-plugin.ts），所以不需要跨域
+ *   - 生产：被 node:http 服务器调用（见 index.ts）
+ * 同一份 handler 两种跑法，避免"开发环境正常、上线就挂"。
  */
 export async function handleApiRequest(req: Request, url: URL): Promise<Response> {
-  const db = getDb();
   const method = req.method.toUpperCase();
 
   if (!url.pathname.startsWith('/api/')) {
@@ -596,7 +584,7 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
   // 注意这里**不**在解析失败时直接 401 —— 公开路由（登录、注册）本来就没有会话，
   // 需要放行。是否强制登录交给下面的 isPublic 判断。
   const token = parseCookies(getHeader(req, 'cookie'))[SESSION_COOKIE];
-  const user = auth.getSessionUser(db, token);
+  const user = await auth.getSessionUser(token);
 
   // 认证闸门：**默认要求登录**，只有显式标记 isPublic 的路由放行。
   //
@@ -618,7 +606,6 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
     // handler 可以直接返回一个 Response（认证接口需要设置 cookie），
     // 也可以返回普通对象（会被包成 200 JSON）。两种都支持。
     const result = await matched.route.handler({
-      db,
       user,
       params: matched.params,
       query: url.searchParams,
@@ -655,12 +642,7 @@ function json(data: unknown, status: number): Response {
  *
  * handler 内部统一用 Web 标准的 Request / Response 写（因为 Vite 的中间件
  * 也是这套标准），但 node:http 是 Node 的老风格。两种环境共用同一份
- * handleApiRequest，只在最外层做一次转换，确保"开发环境能跑"和
- * "生产环境能跑"走的是同一段逻辑。
- *
- * 注意这里用 `req.url`（形如 /api/accounts?month=2024-03），
- * 所以调用方**不需要**先把 Vite 的中间件路径去掉，
- * connect 的 use('/api', ...) 也会保留原始 req.url。
+ * handleApiRequest，只在最外层做一次转换。
  */
 export async function handleApiRequestNode(
   req: import('node:http').IncomingMessage,
@@ -678,8 +660,7 @@ export async function handleApiRequestNode(
 
 /** 给调试用：当前注册了哪些接口 */
 export function listRoutes() {
-  return routes.map((r) => `${r.method} ${'/' + r.segments.join('/')}`);
+  return routes.map((r) => `${r.method} /${r.segments.join('/')}${r.isPublic ? '  (公开)' : ''}`);
 }
 
 export type { ApiError };
-export type { SqlValue };
